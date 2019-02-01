@@ -150,12 +150,13 @@ class Matcher(actorSystem: ActorSystem,
   lazy val matcher: ActorRef = actorSystem.actorOf(
     MatcherActor.props(
       matcherSettings,
-      (self, oldestSnapshotOffset, newestSnapshotOffset) => {
+      startResult => {
         import actorSystem.dispatcher
         implicit val timeout: Timeout = 5.seconds
 
+        val Right((self, oldestSnapshotOffset, newestSnapshotOffset)) = startResult // TODO
         currentOffset = oldestSnapshotOffset
-        setStatus(Status.Working)
+        setStatus(Status.Working) // TODO: when current offset == last kafka offset
 
         matcherQueue.startConsume(
           oldestSnapshotOffset + 1,

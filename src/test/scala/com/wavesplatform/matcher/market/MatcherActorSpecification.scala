@@ -3,6 +3,9 @@ package com.wavesplatform.matcher.market
 import java.util.concurrent.atomic.AtomicReference
 
 import akka.actor.{Actor, ActorRef, Kill, Props, Terminated}
+import akka.persistence.inmemory.extension.{InMemorySnapshotStorage, StorageExtension}
+import akka.persistence.serialization.Snapshot
+import akka.serialization.SerializationExtension
 import akka.testkit.{ImplicitSender, TestActorRef, TestProbe}
 import com.wavesplatform.NTPTime
 import com.wavesplatform.account.PrivateKeyAccount
@@ -72,9 +75,9 @@ class MatcherActorSpecification
           TestActorRef(
             new MatcherActor(
               matcherSettings,
-              (_, _, _) => (),
+              _ => (),
               ob,
-              (_, _) => Props(new FailAtStartActor(pair)),
+              (_, _) => Props(new FailAtStartActor),
               blockchain.assetDescription
             )
           ))
@@ -110,6 +113,71 @@ class MatcherActorSpecification
         probe.expectMsgType[Terminated]
 
         ob.get()(pair1) shouldBe 'left
+      }
+    }
+
+    "continues the work when recovery is successful" in {}
+
+    "stops the work" when {
+      def provideSnapshot(pairs: AssetPair*): Unit = {
+        val snapshot = SerializationExtension(system).serialize(Snapshot(MatcherActor.Snapshot(pairs.toSet))).get
+        val p        = TestProbe()
+        p.send(
+          StorageExtension(system).snapshotStorage,
+          InMemorySnapshotStorage.Save(MatcherActor.name, 0, 0, snapshot)
+        )
+        p.expectMsg(akka.actor.Status.Success(""))
+      }
+
+      "an order book as failed during recovery" in {
+        val pair    = AssetPair(randomAssetId, randomAssetId)
+        val ob      = emptyOrderBookRefs
+        var stopped = false
+
+        val w = TestProbe()
+
+        provideSnapshot(pair)
+        val actor = waitInitialization(
+          TestActorRef(
+            new MatcherActor(
+              matcherSettings,
+              startResult => {
+                stopped = startResult.isLeft
+                println(stopped)
+              },
+              ob,
+              (_, _) => Props(new FailAtStartActor),
+              blockchain.assetDescription
+            )
+          ))
+        w.watch(actor)
+
+        eventually(stopped shouldBe true)
+        w.expectTerminated(actor)
+      }
+
+      "an order book is recovering for a long time" in {
+        val pair    = AssetPair(randomAssetId, randomAssetId)
+        val ob      = emptyOrderBookRefs
+        var stopped = false
+
+        val w = TestProbe()
+
+        provideSnapshot(pair)
+        val actor = waitInitialization(
+          TestActorRef(
+            new MatcherActor(
+              matcherSettings.copy(initializationTimeout = 0.seconds),
+              startResult => stopped = startResult.isLeft,
+              ob,
+              (_, _) => Props(new Actor { override def receive: Receive = Actor.ignoringBehavior }),
+              blockchain.assetDescription
+            )
+          ))
+        w.watch(actor)
+
+        eventually(timeout(1.second))(stopped shouldBe true)
+        w.expectTerminated(actor)
       }
     }
 
@@ -185,7 +253,7 @@ class MatcherActorSpecification
       TestActorRef(
         new MatcherActor(
           matcherSettings.copy(snapshotsInterval = 17),
-          (_, _, _) => (),
+          _ => (),
           emptyOrderBookRefs,
           (assetPair, _) => {
             val idx = assetPairs.indexOf(assetPair)
@@ -227,7 +295,7 @@ class MatcherActorSpecification
       TestActorRef(
         new MatcherActor(
           matcherSettings,
-          (_, _, _) => (),
+          _ => (),
           ob,
           (assetPair, matcher) =>
             OrderBookActor.props(matcher, TestProbe().ref, assetPair, _ => {}, _ => {}, _ => {}, matcherSettings, txFactory, ntpTime),
@@ -245,7 +313,7 @@ class MatcherActorSpecification
 }
 
 object MatcherActorSpecification {
-  private class FailAtStartActor(pair: AssetPair) extends Actor {
+  private class FailAtStartActor extends Actor {
     throw new RuntimeException("I don't want to work today")
     override def receive: Receive = Actor.emptyBehavior
   }

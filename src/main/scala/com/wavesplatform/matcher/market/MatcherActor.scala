@@ -2,7 +2,7 @@ package com.wavesplatform.matcher.market
 
 import java.util.concurrent.atomic.AtomicReference
 
-import akka.actor.{ActorRef, Props, SupervisorStrategy, Terminated}
+import akka.actor.{ActorRef, Cancellable, Props, SupervisorStrategy, Terminated}
 import akka.persistence._
 import com.google.common.base.Charsets
 import com.wavesplatform.matcher.MatcherSettings
@@ -17,8 +17,8 @@ import com.wavesplatform.utils.ScorexLogging
 import play.api.libs.json._
 import scorex.utils._
 
-class MatcherActor(matcherSettings: MatcherSettings,
-                   recoveryCompletedWithEventNr: (ActorRef, Long, Long) => Unit,
+class MatcherActor(settings: MatcherSettings,
+                   recoveryCompletedWithEventNr: Either[Unit, (ActorRef, Long, Long)] => Unit,
                    orderBooks: AtomicReference[Map[AssetPair, Either[Unit, ActorRef]]],
                    orderBookActorProps: (AssetPair, ActorRef) => Props,
                    assetDescription: ByteStr => Option[AssetDescription])
@@ -148,12 +148,13 @@ class MatcherActor(matcherSettings: MatcherSettings,
       }
 
     case Terminated(ref) =>
+      log.error(s"$ref is terminated")
       orderBooks.getAndUpdate { m =>
         childrenNames.get(ref).fold(m)(m.updated(_, Left(())))
       }
 
     case OrderBookSnapshotUpdated(assetPair, eventNr) =>
-      snapshotsState = snapshotsState.updated(assetPair, eventNr, lastProcessedNr, matcherSettings.snapshotsInterval)
+      snapshotsState = snapshotsState.updated(assetPair, eventNr, lastProcessedNr, settings.snapshotsInterval)
   }
 
   override def receiveRecover: Receive = {
@@ -171,14 +172,16 @@ class MatcherActor(matcherSettings: MatcherSettings,
     case RecoveryCompleted =>
       if (orderBooks.get().isEmpty) {
         log.info("Recovery completed!")
-        recoveryCompletedWithEventNr(self, -1, -1)
+        recoveryCompletedWithEventNr(Right((self, -1, -1)))
       } else {
         log.info(s"Recovery completed, waiting order books to restore: ${orderBooks.get().keys.mkString(", ")}")
-        context.become(collectOrderBooks(orderBooks.get().size, Long.MaxValue, Long.MinValue, Map.empty))
+        val cancelableTimeout = context.system.scheduler.scheduleOnce(settings.initializationTimeout, self, InitializationTimeout)(context.dispatcher)
+        context.become(collectOrderBooks(cancelableTimeout, orderBooks.get().size, Long.MaxValue, Long.MinValue, Map.empty))
       }
   }
 
-  private def collectOrderBooks(restOrderBooksNumber: Long,
+  private def collectOrderBooks(cancelableTimeout: Cancellable,
+                                restOrderBooksNumber: Long,
                                 oldestEventNr: Long,
                                 newestEventNr: Long,
                                 currentOffsets: Map[AssetPair, EventOffset]): Receive = {
@@ -191,18 +194,22 @@ class MatcherActor(matcherSettings: MatcherSettings,
       val updatedCurrentOffsets       = currentOffsets.updated(assetPair, snapshotEventNr)
 
       if (updatedRestOrderBooksNumber > 0)
-        context.become(collectOrderBooks(updatedRestOrderBooksNumber, updatedOldestEventNr, updatedNewestEventNr, updatedCurrentOffsets))
-      else becomeWorking(updatedOldestEventNr, updatedNewestEventNr, updatedCurrentOffsets)
-
-    case Terminated(ref) =>
-      orderBooks.getAndUpdate { m =>
-        childrenNames.get(ref).fold(m)(m.updated(_, Left(())))
+        context.become(
+          collectOrderBooks(cancelableTimeout, updatedRestOrderBooksNumber, updatedOldestEventNr, updatedNewestEventNr, updatedCurrentOffsets))
+      else {
+        cancelableTimeout.cancel()
+        becomeWorking(updatedOldestEventNr, updatedNewestEventNr, updatedCurrentOffsets)
       }
 
-      val updatedRestOrderBooksNumber = restOrderBooksNumber - 1
-      if (updatedRestOrderBooksNumber > 0)
-        context.become(collectOrderBooks(updatedRestOrderBooksNumber, oldestEventNr, newestEventNr, currentOffsets))
-      else becomeWorking(oldestEventNr, newestEventNr, currentOffsets)
+    case Terminated(ref) =>
+      log.error(s"Full recovery was failed: $ref is terminated")
+      recoveryCompletedWithEventNr(Left(()))
+      context.stop(self)
+
+    case InitializationTimeout =>
+      log.error(s"Full recovery was failed: initialization took too much time")
+      recoveryCompletedWithEventNr(Left(()))
+      context.stop(self)
 
     case _ => stash()
   }
@@ -214,14 +221,14 @@ class MatcherActor(matcherSettings: MatcherSettings,
       startOffsetToSnapshot = lastProcessedNr,
       currentOffsets = currentOffsets,
       lastProcessedNr = lastProcessedNr,
-      interval = matcherSettings.snapshotsInterval
+      interval = settings.snapshotsInterval
     )
 
     log.info(s"All snapshots are loaded, oldestEventNr: $oldestEventNr, newestEventNr: $newestEventNr")
     log.trace(s"Expecting snapshots at: ${snapshotsState.nearestSnapshotOffsets}")
 
     unstashAll()
-    recoveryCompletedWithEventNr(self, oldestEventNr, newestEventNr)
+    recoveryCompletedWithEventNr(Right((self, oldestEventNr, newestEventNr)))
   }
 
   private def snapshotsCommands: Receive = {
@@ -283,7 +290,7 @@ object MatcherActor {
   def name: String = "matcher"
 
   def props(matcherSettings: MatcherSettings,
-            recoveryCompletedWithEventNr: (ActorRef, Long, Long) => Unit,
+            recoveryCompletedWithEventNr: Either[Unit, (ActorRef, Long, Long)] => Unit,
             orderBooks: AtomicReference[Map[AssetPair, Either[Unit, ActorRef]]],
             orderBookProps: (AssetPair, ActorRef) => Props,
             assetDescription: ByteStr => Option[AssetDescription]): Props =
@@ -330,6 +337,8 @@ object MatcherActor {
                         created: Long,
                         amountAssetInfo: Option[AssetInfo],
                         priceAssetinfo: Option[AssetInfo])
+
+  case object InitializationTimeout
 
   def compare(buffer1: Option[Array[Byte]], buffer2: Option[Array[Byte]]): Int = {
     if (buffer1.isEmpty && buffer2.isEmpty) 0
