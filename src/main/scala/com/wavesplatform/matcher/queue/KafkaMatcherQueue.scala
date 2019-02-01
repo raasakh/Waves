@@ -79,7 +79,7 @@ class KafkaMatcherQueue(settings: Settings)(implicit mat: ActorMaterializer) ext
 
   override def startConsume(fromOffset: QueueEventWithMeta.Offset, process: QueueEventWithMeta => Unit): Unit = {
     log.info(s"Start consuming from $fromOffset")
-    var currentOffset  = fromOffset
+    var currentOffset  = fromOffset // Store locally to know a previous processed offset when the source is restarted
     val topicPartition = new TopicPartition(settings.topic, 0)
 
     RestartSource
@@ -97,7 +97,7 @@ class KafkaMatcherQueue(settings: Settings)(implicit mat: ActorMaterializer) ext
             // We can do it in parallel, because we're just applying verified events
             val req = QueueEventWithMeta(msg.offset(), msg.timestamp(), msg.value())
             process(req)
-            currentOffset = math.max(currentOffset, msg.offset())
+            currentOffset = msg.offset() // Messages are received one-by-one, e.g. offsets: 1, 2, 3, ...
           }
       }
       .runWith(Sink.ignore)

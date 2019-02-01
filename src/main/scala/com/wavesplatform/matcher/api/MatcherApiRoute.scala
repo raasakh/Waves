@@ -17,7 +17,7 @@ import com.wavesplatform.matcher.market.OrderBookActor._
 import com.wavesplatform.matcher.model.LimitOrder.OrderStatus
 import com.wavesplatform.matcher.model._
 import com.wavesplatform.matcher.queue.{QueueEvent, QueueEventWithMeta}
-import com.wavesplatform.matcher.{AddressActor, AssetPairBuilder}
+import com.wavesplatform.matcher.{AddressActor, AssetPairBuilder, Matcher}
 import com.wavesplatform.metrics.TimerExt
 import com.wavesplatform.settings.{RestAPISettings, WavesSettings}
 import com.wavesplatform.state.ByteStr
@@ -48,7 +48,7 @@ case class MatcherApiRoute(assetPairBuilder: AssetPairBuilder,
                            orderValidator: Order => Either[String, Order],
                            orderBookSnapshot: OrderBookSnapshotHttpCache,
                            wavesSettings: WavesSettings,
-                           isDuringShutdown: () => Boolean,
+                           matcherStatus: () => Matcher.Status,
                            db: DB,
                            time: Time,
                            currentOffset: () => QueueEventWithMeta.Offset)
@@ -64,7 +64,7 @@ case class MatcherApiRoute(assetPairBuilder: AssetPairBuilder,
   private val timer      = Kamon.timer("matcher.api-requests")
   private val placeTimer = timer.refine("action" -> "place")
 
-  override lazy val route: Route = shutdownBarrier {
+  override def route: Route = matcherStatusBarrier {
     pathPrefix("matcher") {
       getMatcherPublicKey ~ getOrderBook ~ marketStatus ~ place ~ getAssetPairAndPublicKeyOrderHistory ~ getPublicKeyOrderHistory ~
         getAllOrderHistory ~ tradableBalance ~ reservedBalance ~ orderStatus ~
@@ -73,7 +73,11 @@ case class MatcherApiRoute(assetPairBuilder: AssetPairBuilder,
     }
   }
 
-  private def shutdownBarrier: Directive0 = if (isDuringShutdown()) complete(DuringShutdown) else pass
+  private def matcherStatusBarrier: Directive0 = matcherStatus() match {
+    case Matcher.Status.Working  => pass
+    case Matcher.Status.Starting => complete(DuringStart)
+    case Matcher.Status.Stopping => complete(DuringShutdown)
+  }
 
   private def unavailableOrderBookBarrier(p: AssetPair): Directive0 = orderBook(p) match {
     case Some(Left(_)) => complete(OrderBookUnavailable)
@@ -81,17 +85,18 @@ case class MatcherApiRoute(assetPairBuilder: AssetPairBuilder,
   }
 
   private def withAssetPair(p: AssetPair, redirectToInverse: Boolean = false, suffix: String = ""): Directive1[AssetPair] =
-    assetPairBuilder.validateAssetPair(p) match {
-      case Right(_) => provide(p)
-      case Left(e) if redirectToInverse =>
-        assetPairBuilder
-          .validateAssetPair(p.reverse)
-          .fold(
-            _ => complete(StatusCodes.NotFound -> Json.obj("message" -> e)),
-            _ => redirect(s"/matcher/orderbook/${p.priceAssetStr}/${p.amountAssetStr}$suffix", StatusCodes.MovedPermanently)
-          )
-      case Left(e) => complete(StatusCodes.NotFound -> Json.obj("message" -> e))
-    }
+    provide(p)
+//    assetPairBuilder.validateAssetPair(p) match {
+//      case Right(_) => provide(p)
+//      case Left(e) if redirectToInverse =>
+//        assetPairBuilder
+//          .validateAssetPair(p.reverse)
+//          .fold(
+//            _ => complete(StatusCodes.NotFound -> Json.obj("message" -> e)),
+//            _ => redirect(s"/matcher/orderbook/${p.priceAssetStr}/${p.amountAssetStr}$suffix", StatusCodes.MovedPermanently)
+//          )
+//      case Left(e) => complete(StatusCodes.NotFound -> Json.obj("message" -> e))
+//    }
 
   private def withCancelRequest(f: CancelOrderRequest => Route): Route =
     post {

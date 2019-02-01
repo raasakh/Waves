@@ -15,6 +15,7 @@ import com.google.common.cache.{CacheBuilder, CacheLoader, LoadingCache}
 import com.wavesplatform.account.{Address, PrivateKeyAccount, PublicKeyAccount}
 import com.wavesplatform.api.http.CompositeHttpService
 import com.wavesplatform.db._
+import com.wavesplatform.matcher.Matcher.Status
 import com.wavesplatform.matcher.api.{AlreadyProcessed, MatcherApiRoute, MatcherResponse, OrderBookSnapshotHttpCache}
 import com.wavesplatform.matcher.market.OrderBookActor.MarketStatus
 import com.wavesplatform.matcher.market.{MatcherActor, MatcherTransactionWriter, OrderBookActor}
@@ -32,8 +33,8 @@ import monix.reactive.Observable
 
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
-import scala.util.control.NonFatal
 import scala.util.Failure
+import scala.util.control.NonFatal
 
 class Matcher(actorSystem: ActorSystem,
               time: Time,
@@ -42,15 +43,16 @@ class Matcher(actorSystem: ActorSystem,
               blockchain: Blockchain,
               portfoliosChanged: Observable[Address],
               settings: WavesSettings,
-              matcherPrivateKey: PrivateKeyAccount,
-              isDuringShutdown: () => Boolean)
+              matcherPrivateKey: PrivateKeyAccount)
     extends ScorexLogging {
 
   import settings._
 
   private implicit val materializer: ActorMaterializer = ActorMaterializer()(actorSystem)
 
-  private val currentOffset      = new AtomicReference[QueueEventWithMeta.Offset](-1L)
+  private val status: AtomicReference[Status] = new AtomicReference(Status.Starting)
+  private var currentOffset                   = -1L // Used only for REST API
+
   private val pairBuilder        = new AssetPairBuilder(settings.matcherSettings, blockchain)
   private val orderBookCache     = new ConcurrentHashMap[AssetPair, OrderBook](1000, 0.9f, 10)
   private val transactionCreator = new ExchangeTransactionCreator(blockchain, matcherPrivateKey, matcherSettings)
@@ -132,10 +134,10 @@ class Matcher(actorSystem: ActorSystem,
       validateOrder,
       orderBooksSnapshotCache,
       settings,
-      isDuringShutdown,
+      () => status.get(),
       db,
       time,
-      () => currentOffset.get()
+      () => currentOffset
     )
   )
 
@@ -152,11 +154,14 @@ class Matcher(actorSystem: ActorSystem,
         import actorSystem.dispatcher
         implicit val timeout: Timeout = 5.seconds
 
-        currentOffset.set(oldestSnapshotOffset)
+        currentOffset = oldestSnapshotOffset
+        setStatus(Status.Working)
+
         matcherQueue.startConsume(
           oldestSnapshotOffset + 1,
           eventWithMeta => {
             log.debug(s"[offset=${eventWithMeta.offset}, ts=${eventWithMeta.timestamp}] Consumed ${eventWithMeta.event}")
+            currentOffset = eventWithMeta.offset
 
             // Ignoring possible timeouts or other errors
             // If an order book doesn't process a message, it will re-process all its messages after fix + restart
@@ -164,7 +169,6 @@ class Matcher(actorSystem: ActorSystem,
               .ask(eventWithMeta)
               .mapTo[MatcherResponse]
               .map { r =>
-                currentOffset.getAndAccumulate(eventWithMeta.offset, math.max(_, _))
                 // We don't need to resolve old requests, those was did before restart, because we lost clients connections
                 if (eventWithMeta.offset > newestSnapshotOffset) r match {
                   case AlreadyProcessed =>
@@ -174,7 +178,7 @@ class Matcher(actorSystem: ActorSystem,
               .onComplete {
                 case Failure(e) =>
                   log.warn(s"An error during processing an event with offset ${eventWithMeta.offset}: ${e.getMessage}", e)
-                  requests.get(jLong.valueOf(eventWithMeta.offset)).tryFailure(e)
+                  if (eventWithMeta.offset > newestSnapshotOffset) requests.get(jLong.valueOf(eventWithMeta.offset)).tryFailure(e)
                 case _ =>
               }
           }
@@ -200,6 +204,7 @@ class Matcher(actorSystem: ActorSystem,
 
   def shutdown(): Unit = {
     log.info("Shutting down matcher")
+    setStatus(Status.Stopping)
 
     Await.result(matcherServerBinding.unbind(), 10.seconds)
 
@@ -241,6 +246,11 @@ class Matcher(actorSystem: ActorSystem,
 
     actorSystem.actorOf(MatcherTransactionWriter.props(db, matcherSettings), MatcherTransactionWriter.name)
   }
+
+  private def setStatus(newStatus: Status): Unit = {
+    status.set(newStatus)
+    log.info(s"Status now is $newStatus")
+  }
 }
 
 object Matcher extends ScorexLogging {
@@ -253,15 +263,14 @@ object Matcher extends ScorexLogging {
             allChannels: ChannelGroup,
             blockchain: Blockchain,
             portfoliosChanged: Observable[Address],
-            settings: WavesSettings,
-            isDuringShutdown: () => Boolean): Option[Matcher] =
+            settings: WavesSettings): Option[Matcher] =
     try {
       val privateKey = (for {
         address <- Address.fromString(settings.matcherSettings.account)
         pk      <- wallet.privateKeyAccount(address)
       } yield pk).explicitGet()
 
-      val matcher = new Matcher(actorSystem, time, utx, allChannels, blockchain, portfoliosChanged, settings, privateKey, isDuringShutdown)
+      val matcher = new Matcher(actorSystem, time, utx, allChannels, blockchain, portfoliosChanged, settings, privateKey)
       matcher.runMatcher()
       Some(matcher)
     } catch {
@@ -269,4 +278,11 @@ object Matcher extends ScorexLogging {
         log.warn("Error starting matcher", e)
         None
     }
+
+  sealed trait Status
+  object Status {
+    case object Starting extends Status
+    case object Working  extends Status
+    case object Stopping extends Status
+  }
 }

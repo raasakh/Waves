@@ -217,6 +217,7 @@ class MatcherActor(matcherSettings: MatcherSettings,
       interval = matcherSettings.snapshotsInterval
     )
 
+    log.info(s"All snapshots are loaded, oldestEventNr: $oldestEventNr, newestEventNr: $newestEventNr")
     log.trace(s"Expecting snapshots at: ${snapshotsState.nearestSnapshotOffsets}")
 
     unstashAll()

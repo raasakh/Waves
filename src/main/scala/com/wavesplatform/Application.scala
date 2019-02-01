@@ -106,7 +106,7 @@ class Application(val actorSystem: ActorSystem, val settings: WavesSettings, con
     maybeUtx = Some(utxStorage)
 
     matcher = if (settings.matcherSettings.enable) {
-      Matcher(actorSystem, time, wallet, utxStorage, allChannels, blockchainUpdater, portfolioChanged, settings, () => shutdownInProgress)
+      Matcher(actorSystem, time, wallet, utxStorage, allChannels, blockchainUpdater, portfolioChanged, settings)
     } else None
 
     val knownInvalidBlocks = new InvalidBlockStorageImpl(settings.synchronizationSettings.invalidBlocksStorage)
