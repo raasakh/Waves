@@ -1,5 +1,6 @@
 package com.wavesplatform.database
 
+import cats.Monoid
 import com.google.common.cache.CacheBuilder
 import com.wavesplatform.account.{Address, Alias}
 import com.wavesplatform.block.{Block, BlockHeader}
@@ -15,12 +16,11 @@ import com.wavesplatform.transaction._
 import com.wavesplatform.transaction.assets._
 import com.wavesplatform.transaction.assets.exchange.ExchangeTransaction
 import com.wavesplatform.transaction.lease.{LeaseCancelTransaction, LeaseTransaction}
-import com.wavesplatform.transaction.smart.{ContractInvocationTransaction, SetScriptTransaction}
 import com.wavesplatform.transaction.smart.script.Script
+import com.wavesplatform.transaction.smart.{ContractInvocationTransaction, SetScriptTransaction}
 import com.wavesplatform.transaction.transfer._
 import com.wavesplatform.utils.{Paged, ScorexLogging}
 import org.iq80.leveldb.DB
-import cats.Monoid
 
 import scala.annotation.tailrec
 import scala.collection.mutable.ArrayBuffer
@@ -613,7 +613,7 @@ class LevelDBWriter(writableDB: DB, fs: FunctionalitySettings, val maxCacheSize:
     .recordStats()
     .build[(Int, BigInt), LeaseBalance]()
 
-  override def balanceSnapshots(address: Address, from: Int, to: Int): Seq[BalanceSnapshot] = readOnly { db =>
+  override def balanceSnapshots(address: Address, from: Int, to: Int, onlyFinishedBlocks: Boolean): Seq[BalanceSnapshot] = readOnly { db =>
     db.get(Keys.addressId(address)).fold(Seq(BalanceSnapshot(1, 0, 0, 0))) { addressId =>
       val wbh = slice(db.get(Keys.wavesBalanceHistory(addressId)), from, to)
       val lbh = slice(db.get(Keys.leaseBalanceHistory(addressId)), from, to)
